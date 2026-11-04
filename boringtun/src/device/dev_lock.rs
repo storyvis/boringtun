@@ -45,6 +45,17 @@ pub struct LockReadGuard<'a, T: 'a + ?Sized> {
     inner: RwLockReadGuard<'a, T>,
 }
 
+// Release the writer intent even if an operation unwinds. Otherwise every
+// later read (including DeviceHandle::drop) waits on a flag nobody can clear.
+struct WriteIntentReset<'a>(&'a (Mutex<bool>, Condvar));
+impl Drop for WriteIntentReset<'_> {
+    fn drop(&mut self) {
+        let (lock, cvar) = self.0;
+        *lock.lock() = false;
+        cvar.notify_all();
+    }
+}
+
 impl<T: ?Sized> LockReadGuard<'_, T> {
     /// Perform a closure on a mutable reference of the inner locked value.
     ///
@@ -77,6 +88,8 @@ impl<T: ?Sized> LockReadGuard<'_, T> {
             });
         }
 
+        let reset = WriteIntentReset(self.wants_write);
+
         // Second stage is to run the prep function
         prep_func(&*self.inner);
 
@@ -89,11 +102,7 @@ impl<T: ?Sized> LockReadGuard<'_, T> {
             mut_func(&mut *write_access)
         }));
 
-        // Finally signal other threads
-        let (lock, cvar) = &self.wants_write;
-        let mut wants_write = lock.lock();
-        *wants_write = false;
-        cvar.notify_all();
+        drop(reset);
 
         ret
     }
@@ -104,5 +113,29 @@ impl<T: ?Sized> Deref for LockReadGuard<'_, T> {
 
     fn deref(&self) -> &T {
         &self.inner
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn writer_panic_does_not_strand_readers() {
+        let lock = std::sync::Arc::new(Lock::new(0));
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                lock.read()
+                    .try_writeable(|_| {}, |_| panic!("test operation panic"));
+            }))
+            .is_err()
+        );
+        let (send, receive) = std::sync::mpsc::channel();
+        std::thread::spawn(move || send.send(*lock.read()).unwrap());
+        assert_eq!(
+            receive
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap(),
+            0
+        );
     }
 }

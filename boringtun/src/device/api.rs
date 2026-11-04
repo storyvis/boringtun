@@ -4,12 +4,13 @@
 use std::{
     ffi::CString,
     fs::{create_dir, remove_file},
-    io::{BufRead, BufReader, BufWriter, Write},
+    io::{self, BufRead, BufReader, BufWriter, Read, Write},
     os::unix::{
         io::{AsRawFd, FromRawFd},
         net::{UnixListener, UnixStream},
     },
     sync::atomic::Ordering,
+    time::{Duration, Instant},
 };
 
 use hex::encode as encode_hex;
@@ -21,6 +22,47 @@ use super::{
 use crate::{device::Action, serialization::KeyBytes, x25519};
 
 const SOCK_DIR: &str = "/var/run/wireguard/";
+
+// Each control exchange has a total deadline, not a timeout that a slowly
+// streaming client can renew forever while holding the device lock.
+#[derive(Clone, Copy)]
+struct DeadlineStream<'a> {
+    stream: &'a UnixStream,
+    deadline: Instant,
+}
+impl DeadlineStream<'_> {
+    fn remaining(&self) -> io::Result<Duration> {
+        self.deadline
+            .checked_duration_since(Instant::now())
+            .filter(|d| !d.is_zero())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "UAPI exchange timed out"))
+    }
+}
+impl Read for DeadlineStream<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.stream.set_read_timeout(Some(self.remaining()?))?;
+        self.stream.read(buf)
+    }
+}
+impl Write for DeadlineStream<'_> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.stream.set_write_timeout(Some(self.remaining()?))?;
+        self.stream.write(buf)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.stream.flush()
+    }
+}
+fn read_line(reader: &mut impl BufRead, line: &mut String) -> io::Result<usize> {
+    let count = Read::take(reader, 4097).read_line(line)?;
+    if line.len() > 4096 || !line.ends_with('\n') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "incomplete or oversized UAPI line",
+        ));
+    }
+    Ok(count)
+}
 
 fn create_sock_dir() {
     let _ = create_dir(SOCK_DIR); // Create the directory if it does not exist
@@ -61,10 +103,14 @@ impl Device {
                     return Action::Continue;
                 };
 
-                let mut reader = BufReader::new(&api_conn);
-                let mut writer = BufWriter::new(&api_conn);
+                let stream = DeadlineStream {
+                    stream: &api_conn,
+                    deadline: Instant::now() + Duration::from_secs(2),
+                };
+                let mut reader = BufReader::new(stream.take(1024 * 1024));
+                let mut writer = BufWriter::new(stream);
                 let mut cmd = String::new();
-                if reader.read_line(&mut cmd).is_ok() {
+                if read_line(&mut reader, &mut cmd).is_ok() {
                     cmd.pop(); // pop the new line character
                     let status = match cmd.as_ref() {
                         // Only two commands are legal according to the protocol, get=1 and set=1.
@@ -91,10 +137,14 @@ impl Device {
             Box::new(move |d, _| {
                 // This is the closure that listens on the api file descriptor
 
-                let mut reader = BufReader::new(&io_file);
-                let mut writer = BufWriter::new(&io_file);
+                let stream = DeadlineStream {
+                    stream: &io_file,
+                    deadline: Instant::now() + Duration::from_secs(2),
+                };
+                let mut reader = BufReader::new(stream.take(1024 * 1024));
+                let mut writer = BufWriter::new(stream);
                 let mut cmd = String::new();
-                if reader.read_line(&mut cmd).is_ok() {
+                if read_line(&mut reader, &mut cmd).is_ok() {
                     cmd.pop(); // pop the new line character
                     let status = match cmd.as_ref() {
                         // Only two commands are legal according to the protocol, get=1 and set=1.
@@ -158,7 +208,7 @@ impl Device {
 }
 
 #[allow(unused_must_use)]
-fn api_get(writer: &mut BufWriter<&UnixStream>, d: &Device) -> i32 {
+fn api_get(writer: &mut impl Write, d: &Device) -> i32 {
     // get command requires an empty line, but there is no reason to be religious about it
     if let Some(ref k) = d.key_pair {
         writeln!(writer, "private_key={}", encode_hex(k.0.as_bytes()));
@@ -205,13 +255,13 @@ fn api_get(writer: &mut BufWriter<&UnixStream>, d: &Device) -> i32 {
     0
 }
 
-fn api_set(reader: &mut BufReader<&UnixStream>, d: &mut LockReadGuard<Device>) -> i32 {
+fn api_set(reader: &mut impl BufRead, d: &mut LockReadGuard<Device>) -> i32 {
     d.try_writeable(super::Device::trigger_yield, |device| {
         device.cancel_yield();
 
         let mut cmd = String::new();
 
-        while reader.read_line(&mut cmd).is_ok() {
+        while read_line(reader, &mut cmd).is_ok() {
             cmd.pop(); // remove newline if any
             if cmd.is_empty() {
                 return 0; // Done
@@ -268,16 +318,12 @@ fn api_set(reader: &mut BufReader<&UnixStream>, d: &mut LockReadGuard<Device>) -
             cmd.clear();
         }
 
-        0
+        EPROTO
     })
     .unwrap_or(EIO)
 }
 
-fn api_set_peer(
-    reader: &mut BufReader<&UnixStream>,
-    d: &mut Device,
-    pub_key: x25519::PublicKey,
-) -> i32 {
+fn api_set_peer(reader: &mut impl BufRead, d: &mut Device, pub_key: x25519::PublicKey) -> i32 {
     let mut cmd = String::new();
 
     let mut remove = false;
@@ -287,10 +333,10 @@ fn api_set_peer(
     let mut public_key = pub_key;
     let mut preshared_key = None;
     let mut allowed_ips: Vec<AllowedIP> = Vec::new();
-    while reader.read_line(&mut cmd).is_ok() {
+    while read_line(reader, &mut cmd).is_ok() {
         cmd.pop(); // remove newline if any
         if cmd.is_empty() {
-            d.update_peer(
+            return d.update_peer(
                 public_key,
                 remove,
                 replace_ips,
@@ -299,8 +345,6 @@ fn api_set_peer(
                 keepalive,
                 preshared_key,
             );
-            allowed_ips.clear(); //clear the vector content after update
-            return 0; // Done
         }
         {
             let parsed_cmd: Vec<&str> = cmd.splitn(2, '=').collect();
@@ -337,7 +381,7 @@ fn api_set_peer(
                 },
                 "public_key" => {
                     // Indicates a new peer section. Commit changes for current peer, and continue to next peer
-                    d.update_peer(
+                    let errno = d.update_peer(
                         public_key,
                         remove,
                         replace_ips,
@@ -346,7 +390,15 @@ fn api_set_peer(
                         keepalive,
                         preshared_key,
                     );
-                    allowed_ips.clear(); //clear the vector content after update
+                    if errno != 0 {
+                        return errno;
+                    }
+                    allowed_ips.clear();
+                    remove = false;
+                    replace_ips = false;
+                    endpoint = None;
+                    keepalive = None;
+                    preshared_key = None;
                     match val.parse::<KeyBytes>() {
                         Ok(key_bytes) => public_key = key_bytes.0.into(),
                         Err(_) => return EINVAL,
@@ -361,5 +413,148 @@ fn api_set_peer(
         }
         cmd.clear();
     }
-    0
+    EPROTO
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn uapi_lines_require_newline_and_have_a_size_limit() {
+        for input in ["command", "", &"x".repeat(4097)] {
+            assert!(read_line(&mut io::Cursor::new(input), &mut String::new()).is_err());
+        }
+        let mut line = String::new();
+        assert_eq!(
+            read_line(&mut io::Cursor::new("get=1\n"), &mut line).unwrap(),
+            6
+        );
+        assert_eq!(line, "get=1\n");
+    }
+
+    #[test]
+    fn deadline_is_total_even_when_client_keeps_sending() {
+        let (mut sender, receiver) = UnixStream::pair().unwrap();
+        let sending = std::thread::spawn(move || {
+            for _ in 0..40 {
+                if sender.write_all(b"x").is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        });
+        let start = Instant::now();
+        let mut stream = DeadlineStream {
+            stream: &receiver,
+            deadline: start + Duration::from_millis(40),
+        };
+        let mut byte = [0];
+        while stream.read(&mut byte).is_ok_and(|n| n != 0) {}
+        assert!(start.elapsed() < Duration::from_millis(300));
+        drop(receiver);
+        sending.join().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "Linux root in isolated network and mount namespaces"]
+    fn shutdown_releases_tun_and_udp_with_stalled_and_queued_clients() {
+        use crate::device::{DeviceConfig, DeviceHandle};
+        let name = format!("wgdrop{}", std::process::id());
+        let path = format!("/var/run/wireguard/{name}.sock");
+        for (count, prefix) in [
+            (0, ""),
+            (1, "get="),
+            (1, "set=1\nprivate_key="),
+            (32, "set=1\nprivate_key="),
+        ] {
+            let device = DeviceHandle::new(&name, DeviceConfig::default()).unwrap();
+            let mut configure = UnixStream::connect(&path).unwrap();
+            configure
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            write!(
+                configure,
+                "set=1\nprivate_key={}\nlisten_port=24777\n\n",
+                "01".repeat(32)
+            )
+            .unwrap();
+            let mut reply = String::new();
+            BufReader::new(configure).read_line(&mut reply).unwrap();
+            assert_eq!(reply, "errno=0\n");
+            let mut clients = Vec::new();
+            for _ in 0..count {
+                let mut client = UnixStream::connect(&path).unwrap();
+                client.write_all(prefix.as_bytes()).unwrap();
+                clients.push(client);
+            }
+            std::thread::sleep(Duration::from_millis(100));
+            let start = Instant::now();
+            drop(device);
+            assert!(start.elapsed() < Duration::from_secs(5));
+            let cname = CString::new(name.as_str()).unwrap();
+            assert_eq!(unsafe { libc::if_nametoindex(cname.as_ptr()) }, 0);
+            assert!(std::net::UdpSocket::bind("0.0.0.0:24777").is_ok());
+            assert!(!std::path::Path::new(&path).exists());
+            drop(clients);
+            // Reuse precisely the same TUN and socket names after shutdown.
+            drop(DeviceHandle::new(&name, DeviceConfig::default()).unwrap());
+        }
+    }
+
+    // Run within an isolated network/mount namespace. The control socket may
+    // expose fixture keys, so never run this on a shared host namespace.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "Linux root in isolated network and mount namespaces"]
+    fn peer_sections_do_not_inherit_endpoint_keepalive_psk_or_remove() {
+        use crate::device::{DeviceConfig, DeviceHandle};
+        let name = format!("wgat{}", std::process::id());
+        let device = DeviceHandle::new(&name, DeviceConfig::default()).unwrap();
+        let path = format!("/var/run/wireguard/{name}.sock");
+        let exchange = |request: String| {
+            let mut socket = UnixStream::connect(&path).unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            socket.write_all(request.as_bytes()).unwrap();
+            let mut reader = BufReader::new(socket);
+            let mut response = String::new();
+            loop {
+                let mut line = String::new();
+                assert!(reader.read_line(&mut line).unwrap() != 0);
+                response.push_str(&line);
+                if line == "errno=0\n" {
+                    break;
+                }
+            }
+            response
+        };
+        let (first, second, third) = ("02".repeat(32), "03".repeat(32), "04".repeat(32));
+        exchange(format!(
+            "set=1\nprivate_key={}\npublic_key={first}\nendpoint=192.0.2.1:4477\npersistent_keepalive_interval=25\npreshared_key={}\nallowed_ip=10.88.0.2/32\npublic_key={second}\nallowed_ip=10.88.0.3/32\n\n",
+            "01".repeat(32),
+            "05".repeat(32)
+        ));
+        let response = exchange("get=1\n\n".into());
+        let section = response
+            .split(&format!("public_key={second}\n"))
+            .nth(1)
+            .unwrap()
+            .split("public_key=")
+            .next()
+            .unwrap();
+        assert!(!section.contains("endpoint="));
+        assert!(!section.contains("persistent_keepalive_interval=25"));
+        assert!(!section.contains(&"05".repeat(32)));
+        assert!(!section.contains("allowed_ip=10.88.0.2/32"));
+        exchange(format!(
+            "set=1\npublic_key={first}\nremove=true\npublic_key={third}\nallowed_ip=10.88.0.4/32\n\n"
+        ));
+        let response = exchange("get=1\n\n".into());
+        assert!(!response.contains(&format!("public_key={first}\n")));
+        assert!(response.contains(&format!("public_key={third}\n")));
+        drop(device);
+    }
 }
