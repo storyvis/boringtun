@@ -459,6 +459,46 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     #[ignore = "Linux root in isolated network and mount namespaces"]
+    fn datagram_before_key_configuration_does_not_kill_a_worker() {
+        use crate::device::{DeviceConfig, DeviceHandle};
+        assert!(
+            std::process::Command::new("ip")
+                .args(["link", "set", "lo", "up"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let name = format!("wgkey{}", std::process::id());
+        let device = DeviceHandle::new(&name, DeviceConfig::default()).unwrap();
+        let mut socket = UnixStream::connect(format!("/var/run/wireguard/{name}.sock")).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        socket.write_all(b"get=1\n\n").unwrap();
+        let mut reader = BufReader::new(socket);
+        let mut port = None;
+        loop {
+            let mut line = String::new();
+            assert!(reader.read_line(&mut line).unwrap() != 0);
+            if let Some(value) = line.strip_prefix("listen_port=") {
+                port = Some(value.trim().parse::<u16>().unwrap());
+            }
+            if line == "errno=0\n" {
+                break;
+            }
+        }
+        std::net::UdpSocket::bind("127.0.0.1:0")
+            .unwrap()
+            .send_to(&[0u8; 148], (std::net::Ipv4Addr::LOCALHOST, port.unwrap()))
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(device.threads.iter().all(|thread| !thread.is_finished()));
+        drop(device);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "Linux root in isolated network and mount namespaces"]
     fn shutdown_releases_tun_and_udp_with_stalled_and_queued_clients() {
         use crate::device::{DeviceConfig, DeviceHandle};
         let name = format!("wgdrop{}", std::process::id());

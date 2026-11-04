@@ -638,17 +638,24 @@ impl Device {
             udp.as_raw_fd(),
             Box::new(move |d, t| {
                 // Handler that handles anonymous packets over UDP
-                let mut iter = MAX_ITR;
-                let (private_key, public_key) = d.key_pair.as_ref().expect("Key not set");
-
-                let rate_limiter = d.rate_limiter.as_ref().unwrap();
-
                 // Loop while we have packets on the anonymous connection
 
                 // Safety: the `recv_from` implementation promises not to write uninitialised
                 // bytes to the buffer, so this casting is safe.
                 let src_buf = unsafe { &mut *(&raw mut t.src_buf[..] as *mut [MaybeUninit<u8>]) };
-                while let Ok((packet_len, addr)) = udp.recv_from(src_buf) {
+                // Rejected packets and cookie replies consume the same budget
+                // as accepted traffic, so a flood cannot monopolize this worker.
+                for _ in 0..MAX_ITR {
+                    let Ok((packet_len, addr)) = udp.recv_from(src_buf) else {
+                        break;
+                    };
+                    // A newly opened listener can receive traffic before the
+                    // first UAPI configuration has installed its key.
+                    let (Some((private_key, public_key)), Some(rate_limiter)) =
+                        (d.key_pair.as_ref(), d.rate_limiter.as_ref())
+                    else {
+                        continue;
+                    };
                     let packet = &t.src_buf[..packet_len];
                     // The rate limiter initially checks mac1 and mac2, and optionally asks to send a cookie
                     let parsed_packet = match rate_limiter.verify_packet(
@@ -745,11 +752,6 @@ impl Device {
                     {
                         d.register_conn_handler(Arc::clone(peer), sock, ip_addr)
                             .unwrap();
-                    }
-
-                    iter -= 1;
-                    if iter == 0 {
-                        break;
                     }
                 }
                 Action::Continue
