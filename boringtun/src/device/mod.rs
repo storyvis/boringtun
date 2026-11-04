@@ -43,7 +43,7 @@ use std::{
     os::unix::io::AsRawFd,
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     thread::{self, JoinHandle},
     time::Duration,
@@ -120,6 +120,7 @@ enum Action {
 type Handler = Box<dyn Fn(&mut LockReadGuard<Device>, &mut ThreadData) -> Action + Send + Sync>;
 
 pub struct DeviceHandle {
+    shutdown: Arc<AtomicBool>,
     device: Arc<Lock<Device>>, // The interface this handle owns
     threads: Vec<JoinHandle<()>>,
 }
@@ -192,16 +193,19 @@ impl DeviceHandle {
 
         let interface_lock = Arc::new(Lock::new(wg_interface));
 
+        let shutdown = Arc::new(AtomicBool::new(false));
         let mut threads = Vec::new();
 
         for i in 0..n_threads {
             threads.push({
                 let dev = Arc::clone(&interface_lock);
-                thread::spawn(move || DeviceHandle::event_loop(i, &dev))
+                let shutdown = Arc::clone(&shutdown);
+                thread::spawn(move || DeviceHandle::event_loop(i, &dev, &shutdown))
             });
         }
 
         Ok(DeviceHandle {
+            shutdown,
             device: interface_lock,
             threads,
         })
@@ -220,7 +224,7 @@ impl DeviceHandle {
         }
     }
 
-    fn event_loop(_i: usize, device: &Lock<Device>) {
+    fn event_loop(_i: usize, device: &Lock<Device>, shutdown: &AtomicBool) {
         #[cfg(target_os = "linux")]
         let mut thread_local = ThreadData {
             src_buf: [0u8; MAX_UDP_SIZE],
@@ -261,13 +265,22 @@ impl DeviceHandle {
         let uapi_fd = device.read().uapi_fd;
 
         loop {
+            if shutdown.load(Ordering::Acquire) {
+                return;
+            }
             // The event loop keeps a read lock on the device, because we assume write access is rarely needed
             let mut device_lock = device.read();
             let queue = Arc::clone(&device_lock.queue);
 
             loop {
+                if shutdown.load(Ordering::Acquire) {
+                    return;
+                }
                 match queue.wait() {
                     WaitResult::Ok(handler) => {
+                        if shutdown.load(Ordering::Acquire) {
+                            return;
+                        }
                         let action = (*handler)(&mut device_lock, &mut thread_local);
                         match action {
                             Action::Continue => {}
@@ -294,7 +307,14 @@ impl DeviceHandle {
 
 impl Drop for DeviceHandle {
     fn drop(&mut self) {
+        // Stop dispatching queued clients before waiting for active exchanges.
+        self.shutdown.store(true, Ordering::Release);
         self.device.read().trigger_exit();
+        // Finish all workers before releasing ownership to a replacement
+        // device. UAPI connections have a finite per-exchange deadline.
+        while let Some(thread) = self.threads.pop() {
+            let _ = thread.join();
+        }
         self.clean();
     }
 }
@@ -329,24 +349,23 @@ impl Device {
         allowed_ips: &[AllowedIP],
         keepalive: Option<u16>,
         preshared_key: Option<[u8; 32]>,
-    ) {
+    ) -> i32 {
         if remove {
             // Completely remove a peer
             self.remove_peer(&pub_key);
-            return;
+            return 0;
         }
 
-        // Update an existing peer
-        // We already have a peer, we need to merge the existing config into the newly created one
-        assert!(
-            !self.peers.contains_key(&pub_key),
-            "Modifying existing peers is not yet supported. Remove and add again instead."
-        );
+        // In-place updates are not implemented by this backend. Preserve the
+        // peer and report the limitation instead of panicking a worker.
+        if self.peers.contains_key(&pub_key) {
+            return libc::EOPNOTSUPP;
+        }
 
         let next_index = self.next_index();
         let Some(device_key_pair) = self.key_pair.as_ref() else {
             tracing::error!("Private key must be set first");
-            return;
+            return libc::EINVAL;
         };
 
         let tunn = Tunn::new(
@@ -370,6 +389,7 @@ impl Device {
         }
 
         tracing::info!("Peer added");
+        0
     }
 
     pub fn new(name: &str, config: DeviceConfig) -> Result<Device, Error> {
@@ -618,17 +638,24 @@ impl Device {
             udp.as_raw_fd(),
             Box::new(move |d, t| {
                 // Handler that handles anonymous packets over UDP
-                let mut iter = MAX_ITR;
-                let (private_key, public_key) = d.key_pair.as_ref().expect("Key not set");
-
-                let rate_limiter = d.rate_limiter.as_ref().unwrap();
-
                 // Loop while we have packets on the anonymous connection
 
                 // Safety: the `recv_from` implementation promises not to write uninitialised
                 // bytes to the buffer, so this casting is safe.
                 let src_buf = unsafe { &mut *(&raw mut t.src_buf[..] as *mut [MaybeUninit<u8>]) };
-                while let Ok((packet_len, addr)) = udp.recv_from(src_buf) {
+                // Rejected packets and cookie replies consume the same budget
+                // as accepted traffic, so a flood cannot monopolize this worker.
+                for _ in 0..MAX_ITR {
+                    let Ok((packet_len, addr)) = udp.recv_from(src_buf) else {
+                        break;
+                    };
+                    // A newly opened listener can receive traffic before the
+                    // first UAPI configuration has installed its key.
+                    let (Some((private_key, public_key)), Some(rate_limiter)) =
+                        (d.key_pair.as_ref(), d.rate_limiter.as_ref())
+                    else {
+                        continue;
+                    };
                     let packet = &t.src_buf[..packet_len];
                     // The rate limiter initially checks mac1 and mac2, and optionally asks to send a cookie
                     let parsed_packet = match rate_limiter.verify_packet(
@@ -725,11 +752,6 @@ impl Device {
                     {
                         d.register_conn_handler(Arc::clone(peer), sock, ip_addr)
                             .unwrap();
-                    }
-
-                    iter -= 1;
-                    if iter == 0 {
-                        break;
                     }
                 }
                 Action::Continue

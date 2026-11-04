@@ -11,7 +11,7 @@ mod tests {
     };
     use base64::encode as base64encode;
     use hex::encode;
-    use rand_core::OsRng;
+    use aead::rand_core::OsRng;
     use ring::rand::{SecureRandom, SystemRandom};
     use std::{
         fmt::Write as _,
@@ -21,7 +21,7 @@ mod tests {
         process::Command,
         sync::{
             Arc,
-            sync::atomic::{AtomicUsize, Ordering},
+            atomic::{AtomicUsize, Ordering},
         },
         thread,
     };
@@ -488,7 +488,7 @@ mod tests {
         let wg = WGHandle::init("192.0.2.0".parse().unwrap(), "::2".parse().unwrap());
         assert!(wg.wg_get().ends_with("errno=0\n\n"));
         assert_eq!(wg.wg_set_port(port), "errno=0\n\n");
-        assert_eq!(wg.wg_set_key(private_key), "errno=0\n\n");
+        assert_eq!(wg.wg_set_key(private_key.clone()), "errno=0\n\n");
 
         // Check that the response matches what we expect
         assert_eq!(

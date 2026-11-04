@@ -124,7 +124,7 @@ impl Peer {
             .expect("Attempt to connect to undefined endpoint");
 
         let udp_conn =
-            socket2::Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::UDP))?;
+            socket2::Socket::new(Domain::for_address(addr), Type::DGRAM, Some(Protocol::UDP))?;
         udp_conn.set_reuse_address(true)?;
         let bind_addr = if addr.is_ipv4() {
             SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port).into()
@@ -177,5 +177,31 @@ impl Peer {
 
     pub fn index(&self) -> u32 {
         self.index
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn connected_endpoint_sends_udp_datagrams() {
+        let receiver = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        receiver
+            .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+            .unwrap();
+        let tunnel = Tunn::new(
+            crate::x25519::StaticSecret::from([1; 32]),
+            crate::x25519::PublicKey::from([2; 32]),
+            None,
+            None,
+            1,
+            None,
+        );
+        let peer = Peer::new(tunnel, 1, Some(receiver.local_addr().unwrap()), &[], None);
+        let connected = peer.connect_endpoint(0, None).unwrap();
+        connected.send(b"probe").unwrap();
+        let mut buffer = [0; 16];
+        assert_eq!(receiver.recv(&mut buffer).unwrap(), 5);
+        assert_eq!(&buffer[..5], b"probe");
     }
 }
